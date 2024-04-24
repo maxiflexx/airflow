@@ -1,0 +1,17 @@
+[[source]]
+url = "https://pypi.org/simple"
+verify_ssl = true
+name = "pypi"
+
+[packages]
+apache-airflow = {extras = ["amazon"], version = "*"}
+minio = "*"
+
+[dev-packages]
+ipykernel = "*"
+black = "*"
+pre-commit = "*"
+
+[requires]
+python_version = "3.12"
+python_full_version = "3.12.0"
