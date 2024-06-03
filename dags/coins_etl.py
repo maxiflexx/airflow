@@ -1,4 +1,5 @@
 import datetime as dt
+import time
 
 import airflow.utils.dates
 import pandas as pd
@@ -13,40 +14,66 @@ dag = DAG(
     dag_id="coins_etl_dag",
     description="ETL DAG for fetching coin data from the Upbit API, transforming it, and storing it in Opensearch via the data-io server.",
     schedule_interval=dt.timedelta(minutes=1),
-    start_date=airflow.utils.dates.days_ago(0, hour=2, minute=5),
+    start_date=airflow.utils.dates.days_ago(0, hour=5, minute=19),
     catchup=False,
     render_template_as_native_obj=True,
 )
 
 
+def _get_markets():
+    data_io_conn = BaseHook.get_connection(conn_id="data-io")
+    url = f"{data_io_conn.schema}://{data_io_conn.host}:{data_io_conn.port}/markets"
+
+    res = requests.get(url=url)
+
+    data = res.json()
+
+    enabled_markets = list(filter(lambda market: market["isEnabled"] == True, data))
+    return enabled_markets  # xcom push
+
+
+get_markets = PythonOperator(
+    task_id="get_markets",
+    python_callable=_get_markets,
+    dag=dag,
+)
+
+
 # ts: ISO string
 # ds: YYYYMMDD
-def _extract_coins(ts, ds, **_):
+def _extract_coins(ts, ds, ti, **_):
     upbit_conn = BaseHook.get_connection(conn_id="upbit")
-
     url = f"{upbit_conn.host}/v1/candles/minutes/1"
-    market_name = "KRW-BTC"
 
-    response = requests.get(
-        url=url,
-        params={
-            "market": market_name,
-            "to": ts,
-            "count": 1,
-        },
-        headers={"accept": "application/json"},
-    )
+    enabled_markets = ti.xcom_pull(task_ids="get_markets")
 
-    data = response.json()
+    coins = []
+    for market in enabled_markets:
+        market_code = market["code"]
 
-    write_minio_object(
-        market_name=str(market_name),
-        date_str=ds,
-        data=data,
-        data_type="raws",
-    )
+        response = requests.get(
+            url=url,
+            params={
+                "market": market_code,
+                "to": ts,
+                "count": 1,
+            },
+            headers={"accept": "application/json"},
+        )
 
-    return data  # xcom push
+        data = response.json()
+
+        write_minio_object(
+            market_name=str(market_code),
+            date_str=ds,
+            data=data,
+            data_type="raws",
+        )
+
+        time.sleep(0.1)  # 0.1초
+        coins = [*coins, *data]
+
+    return coins  # xcom push
 
 
 extract_coins = PythonOperator(
@@ -72,14 +99,16 @@ def _transform_raw_data(df: pd.DataFrame):
 
 
 def _write_processed(df: pd.DataFrame, ds: str):
-    market_name = "KRW-BTC"
+    markets = df["market"].unique()
 
-    write_minio_object(
-        market_name=str(market_name),
-        date_str=ds,
-        data=df.to_dict(orient="records"),
-        data_type="processed",
-    )
+    for market in markets:
+        data = df[df["market"] == market].to_dict(orient="records")
+        write_minio_object(
+            market_name=str(market),
+            date_str=ds,
+            data=data,
+            data_type="processed",
+        )
 
 
 transform_coins = PandasOperator(
@@ -115,4 +144,4 @@ load_coins = PythonOperator(
 )
 
 
-extract_coins >> transform_coins >> load_coins
+get_markets >> extract_coins >> transform_coins >> load_coins
