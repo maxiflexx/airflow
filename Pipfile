@@ -6,6 +6,7 @@ name = "pypi"
 [packages]
 apache-airflow = {extras = ["amazon"], version = "*"}
 minio = "*"
+pytest = "*"
 
 [dev-packages]
 ipykernel = "*"
