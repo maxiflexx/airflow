@@ -50,3 +50,17 @@ def write_minio_object(
         length=-1,
         part_size=5 * 1024 * 1024,
     )
+
+
+def get_minio_object(files):
+    minio_conn = BaseHook.get_connection(conn_id="minio")
+    client = get_minio_client(minio_conn)
+
+    bucket_name = json.loads(minio_conn._extra)["bucket_name"]
+
+    answer = []
+    for filename in files:
+        res = client.get_object(bucket_name, filename)
+
+        answer.extend(json.loads(res.data))
+    return answer
