@@ -3,13 +3,14 @@ import time
 
 import airflow.utils.dates
 import pandas as pd
-import requests
 from airflow import DAG
 from airflow.hooks.base import BaseHook
 from airflow.operators.empty import EmptyOperator
 from airflow.operators.python import BranchPythonOperator, PythonOperator
+from libs.data_io import get_coins, get_markets
 from libs.datalake import generate_object_name, get_minio_object, write_minio_object
 from libs.date import generate_end_dates
+from libs.upbit import get_market_candles
 from operators.pandas_operator import PandasOperator
 
 dag = DAG(
@@ -22,48 +23,29 @@ dag = DAG(
 )
 
 
-def _get_markets():
-    data_io_conn = BaseHook.get_connection(conn_id="data-io")
-    url = f"{data_io_conn.schema}://{data_io_conn.host}:{data_io_conn.port}/markets"
+def _get_enabled_markets():
+    markets = get_markets()
 
-    res = requests.get(url=url)
-
-    data = res.json()
-
-    enabled_markets = list(filter(lambda market: market["isEnabled"] == True, data))
+    enabled_markets = list(filter(lambda market: market["isEnabled"] == True, markets))
     return enabled_markets  # xcom push
 
 
-get_markets = PythonOperator(
-    task_id="get_markets",
-    python_callable=_get_markets,
+get_enabled_markets = PythonOperator(
+    task_id="get_enabled_markets",
+    python_callable=_get_enabled_markets,
     dag=dag,
 )
 
 
 def _get_latest_coins(ti, **_):
-    data_io_conn = BaseHook.get_connection(conn_id="data-io")
-    url = f"{data_io_conn.schema}://{data_io_conn.host}:{data_io_conn.port}/coins"
-
-    enabled_markets = ti.xcom_pull(task_ids="get_markets")
+    enabled_markets = ti.xcom_pull(task_ids="get_enabled_markets")
 
     recent_coin_exists = []
     no_recent_coin = []
 
     for market in enabled_markets:
         market_code = market["code"]
-
-        # data-io에 startDate, endDate 디폴트값은 전날부터 요청 시간까지
-        response = requests.get(
-            url=url,
-            params={
-                "market": market_code,
-                "limit": 1,
-            },
-        )
-
-        res = response.json()
-
+        res = get_coins(market=market_code, limit=1)
         latest_coins = res["data"]
 
         if len(latest_coins) == 0:
@@ -128,19 +110,13 @@ def get_coins_one_day(market):
     for idx, end_date in enumerate(end_dates):
         print(f"{market} request... {idx}")
         try:
-            response = requests.get(
-                url=upbit_url,
-                params={
-                    "market": market,
-                    "to": end_date,
-                    "count": count,
-                },
+            candles = get_market_candles(
+                market=market,
+                to=end_date,
+                count=count,
             )
-            response.raise_for_status()
 
-            res = response.json()
-
-            answer += res
+            answer += candles
             print(f"success")
         except:
             print(f"failed")
@@ -171,7 +147,6 @@ crawl_recent_coin = PythonOperator(
 
 
 def _transform_raw_data(df: pd.DataFrame):
-    print("transform start!!!")
     answer = df.rename(
         columns={
             "candle_date_time_utc": "candleDateTimeUtc",
@@ -184,7 +159,6 @@ def _transform_raw_data(df: pd.DataFrame):
             "candle_acc_trade_volume": "candleAccTradeVolume",
         }
     )
-    print("transform end!!!")
     return answer
 
 
@@ -202,9 +176,7 @@ def _write_processed(df: pd.DataFrame, ds: str):
 
 
 def get_data_from_minio(files):
-    print("input start!!!")
     answer = get_minio_object(files)
-    print("input end!!!")
     return pd.DataFrame(answer)
 
 
@@ -222,10 +194,10 @@ transform_coins = PandasOperator(
     dag=dag,
 )
 
-end_task = EmptyOperator(task_id="end", dag=dag)
+end_task = EmptyOperator(task_id="end_task", dag=dag)
 
 
-get_markets >> get_latest_coins >> choose_next_task
+get_enabled_markets >> get_latest_coins >> choose_next_task
 choose_next_task >> [end_task, start_crawl]
 start_crawl >> crawl_recent_coin >> transform_coins >> end_task
 

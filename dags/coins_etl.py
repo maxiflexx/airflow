@@ -3,11 +3,11 @@ import time
 
 import airflow.utils.dates
 import pandas as pd
-import requests
 from airflow import DAG
-from airflow.hooks.base import BaseHook
 from airflow.operators.python import PythonOperator
+from libs.data_io import get_markets, upsert_coins
 from libs.datalake import write_minio_object
+from libs.upbit import get_market_candles
 from operators.pandas_operator import PandasOperator
 
 dag = DAG(
@@ -20,21 +20,16 @@ dag = DAG(
 )
 
 
-def _get_markets():
-    data_io_conn = BaseHook.get_connection(conn_id="data-io")
-    url = f"{data_io_conn.schema}://{data_io_conn.host}:{data_io_conn.port}/markets"
+def _get_enabled_markets():
+    markets = get_markets()
 
-    res = requests.get(url=url)
-
-    data = res.json()
-
-    enabled_markets = list(filter(lambda market: market["isEnabled"] == True, data))
+    enabled_markets = list(filter(lambda market: market["isEnabled"] == True, markets))
     return enabled_markets  # xcom push
 
 
-get_markets = PythonOperator(
-    task_id="get_markets",
-    python_callable=_get_markets,
+get_enabled_markets = PythonOperator(
+    task_id="get_enabled_markets",
+    python_callable=_get_enabled_markets,
     dag=dag,
 )
 
@@ -42,36 +37,22 @@ get_markets = PythonOperator(
 # ts: ISO string
 # ds: YYYYMMDD
 def _extract_coins(ts, ds, ti, **_):
-    upbit_conn = BaseHook.get_connection(conn_id="upbit")
-    url = f"{upbit_conn.host}/v1/candles/minutes/1"
-
-    enabled_markets = ti.xcom_pull(task_ids="get_markets")
+    enabled_markets = ti.xcom_pull(task_ids="get_enabled_markets")
 
     coins = []
     for market in enabled_markets:
         market_code = market["code"]
-
-        response = requests.get(
-            url=url,
-            params={
-                "market": market_code,
-                "to": ts,
-                "count": 1,
-            },
-            headers={"accept": "application/json"},
-        )
-
-        data = response.json()
+        raws = get_market_candles(market=market_code, to=ts, count=1)
 
         write_minio_object(
             market_name=str(market_code),
             date_str=ds,
-            data=data,
+            data=raws,
             data_type="raws",
         )
 
-        time.sleep(0.1)  # 0.1초
-        coins = [*coins, *data]
+        time.sleep(0.2)  # 0.2초
+        coins = [*coins, *raws]
 
     return coins  # xcom push
 
@@ -127,14 +108,8 @@ transform_coins = PandasOperator(
 
 
 def _load_coins(ti):
-    data_io_conn = BaseHook.get_connection(conn_id="data-io")
-
-    url = f"{data_io_conn.schema}://{data_io_conn.host}:{data_io_conn.port}/coins"
     data = ti.xcom_pull(task_ids="transform_coins")
-
-    res = requests.post(url=url, json=data)
-
-    res.raise_for_status()
+    upsert_coins(data)
 
 
 load_coins = PythonOperator(
@@ -144,4 +119,4 @@ load_coins = PythonOperator(
 )
 
 
-get_markets >> extract_coins >> transform_coins >> load_coins
+get_enabled_markets >> extract_coins >> transform_coins >> load_coins
