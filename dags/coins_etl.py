@@ -5,8 +5,9 @@ import airflow.utils.dates
 import pandas as pd
 from airflow import DAG
 from airflow.operators.python import PythonOperator
+from libs.coins import transform_raw_data
 from libs.data_io import get_markets, upsert_coins
-from libs.datalake import write_minio_object
+from libs.datalake import PROCESSED, RAWS, write_to_minio
 from libs.upbit import get_market_candles
 from operators.pandas_operator import PandasOperator
 
@@ -44,11 +45,11 @@ def _extract_coins(ts, ds, ti, **_):
         market_code = market["code"]
         raws = get_market_candles(market=market_code, to=ts, count=1)
 
-        write_minio_object(
+        write_to_minio(
             market_name=str(market_code),
             date_str=ds,
             data=raws,
-            data_type="raws",
+            data_type=RAWS,
         )
 
         time.sleep(0.2)  # 0.2초
@@ -64,31 +65,16 @@ extract_coins = PythonOperator(
 )
 
 
-def _transform_raw_data(df: pd.DataFrame):
-    return df.rename(
-        columns={
-            "candle_date_time_utc": "candleDateTimeUtc",
-            "candle_date_time_kst": "candleDateTimeKst",
-            "opening_price": "openingPrice",
-            "high_price": "highPrice",
-            "low_price": "lowPrice",
-            "trade_price": "tradePrice",
-            "candle_acc_trade_price": "candleAccTradePrice",
-            "candle_acc_trade_volume": "candleAccTradeVolume",
-        }
-    )
-
-
 def _write_processed(df: pd.DataFrame, ds: str):
     markets = df["market"].unique()
 
     for market in markets:
         data = df[df["market"] == market].to_dict(orient="records")
-        write_minio_object(
+        write_to_minio(
             market_name=str(market),
             date_str=ds,
             data=data,
-            data_type="processed",
+            data_type=PROCESSED,
         )
 
 
@@ -98,7 +84,7 @@ transform_coins = PandasOperator(
     input_callable_kwargs={
         "data": "{{ ti.xcom_pull(task_ids='extract_coins') }}",
     },
-    transform_callable=_transform_raw_data,
+    transform_callable=transform_raw_data,
     output_callable=_write_processed,
     output_callable_kwargs={
         "ds": "{{ ds }}",
@@ -107,14 +93,10 @@ transform_coins = PandasOperator(
 )
 
 
-def _load_coins(ti):
-    data = ti.xcom_pull(task_ids="transform_coins")
-    upsert_coins(data)
-
-
 load_coins = PythonOperator(
     task_id="load_coins",
-    python_callable=_load_coins,
+    python_callable=upsert_coins,
+    op_kwargs={"data": "{{ ti.xcom_pull(task_ids='transform_coins') }}"},
     dag=dag,
 )
 

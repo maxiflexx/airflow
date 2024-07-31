@@ -4,11 +4,17 @@ import time
 import airflow.utils.dates
 import pandas as pd
 from airflow import DAG
-from airflow.hooks.base import BaseHook
 from airflow.operators.empty import EmptyOperator
 from airflow.operators.python import BranchPythonOperator, PythonOperator
-from libs.data_io import get_coins, get_markets
-from libs.datalake import generate_object_name, get_minio_object, write_minio_object
+from libs.coins import transform_raw_data
+from libs.data_io import get_coins, get_markets, upsert_coins
+from libs.datalake import (
+    PROCESSED,
+    RAWS,
+    get_minio_object,
+    write_data_by_date,
+    write_to_minio,
+)
 from libs.date import generate_end_dates
 from libs.upbit import get_market_candles
 from operators.pandas_operator import PandasOperator
@@ -84,25 +90,16 @@ def _crawl_recent_coin(ti, **_):
     files = []
     for market in no_recent_market:
         coins = get_coins_one_day(market)
-        split_data = split_by_day(coins, "candle_date_time_utc")
-
-        for date in split_data.keys():
-            write_minio_object(
-                market_name=str(market),
-                date_str=date,
-                data=split_data[date],
-                data_type="raws",
-            )
-
-            filename = generate_object_name("raws", market, date)
-            files.append(filename)
+        files = write_data_by_date(
+            market,
+            "candle_date_time_utc",
+            coins,
+            RAWS,
+        )
     return files
 
 
 def get_coins_one_day(market):
-    upbit_conn = BaseHook.get_connection(conn_id="upbit")
-    upbit_url = f"{upbit_conn.host}/v1/candles/minutes/1"
-
     end_dates = generate_end_dates()
     count = 200
 
@@ -121,24 +118,8 @@ def get_coins_one_day(market):
         except:
             print(f"failed")
 
-        time.sleep(0.1)  # 0.5초 대기
+        time.sleep(0.2)
     return answer
-
-
-def split_by_day(data, date_column):
-    df = pd.DataFrame(data)
-    df[date_column] = pd.to_datetime(df[date_column])
-    unique_dates = df[date_column].dt.date.unique()
-    split_data = {}
-
-    for date in unique_dates:
-        daily_data = df[df[date_column].dt.date == date]
-        daily_data[date_column] = daily_data[date_column].astype(str)
-
-        formatted = "".join(date.isoformat().split("-"))
-        split_data[formatted] = daily_data.to_dict(orient="records")
-
-    return split_data
 
 
 crawl_recent_coin = PythonOperator(
@@ -146,51 +127,37 @@ crawl_recent_coin = PythonOperator(
 )
 
 
-def _transform_raw_data(df: pd.DataFrame):
-    answer = df.rename(
-        columns={
-            "candle_date_time_utc": "candleDateTimeUtc",
-            "candle_date_time_kst": "candleDateTimeKst",
-            "opening_price": "openingPrice",
-            "high_price": "highPrice",
-            "low_price": "lowPrice",
-            "trade_price": "tradePrice",
-            "candle_acc_trade_price": "candleAccTradePrice",
-            "candle_acc_trade_volume": "candleAccTradeVolume",
-        }
-    )
-    return answer
-
-
 def _write_processed(df: pd.DataFrame, ds: str):
     markets = df["market"].unique()
 
     for market in markets:
         data = df[df["market"] == market].to_dict(orient="records")
-        write_minio_object(
+        write_to_minio(
             market_name=str(market),
             date_str=ds,
             data=data,
-            data_type="processed",
+            data_type=PROCESSED,
         )
-
-
-def get_data_from_minio(files):
-    answer = get_minio_object(files)
-    return pd.DataFrame(answer)
 
 
 transform_coins = PandasOperator(
     task_id="transform_coins",
-    input_callable=get_data_from_minio,
+    input_callable=lambda **kwargs: pd.DataFrame(get_minio_object(kwargs["files"])),
     input_callable_kwargs={
         "files": "{{ ti.xcom_pull(task_ids='crawl_recent_coin') }}",
     },
-    transform_callable=_transform_raw_data,
+    transform_callable=transform_raw_data,
     output_callable=_write_processed,
     output_callable_kwargs={
         "ds": "{{ ds }}",
     },
+    dag=dag,
+)
+
+load_coins = PythonOperator(
+    task_id="load_coins",
+    python_callable=upsert_coins,
+    op_kwargs={"data": "{{ ti.xcom_pull(task_ids='transform_coins') }}"},
     dag=dag,
 )
 
@@ -199,10 +166,4 @@ end_task = EmptyOperator(task_id="end_task", dag=dag)
 
 get_enabled_markets >> get_latest_coins >> choose_next_task
 choose_next_task >> [end_task, start_crawl]
-start_crawl >> crawl_recent_coin >> transform_coins >> end_task
-
-"""
-코드 정리 필요
-덮어쓰기 로직 필요
-중복되는 태스크 존재 -> group 살펴볼것
-"""
+start_crawl >> crawl_recent_coin >> transform_coins >> load_coins >> end_task
